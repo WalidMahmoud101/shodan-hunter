@@ -279,10 +279,13 @@ def stream_search(api, query, label, seen_keys, query_writer, master_writer):
                         query_writer.write(item)
                         master_writer.write(item)
                         new_count += 1
-                total         = result.get("total", 0)
-                fetched       = (page - 1) * PAGE_SIZE + len(matches)
+                total   = result.get("total", 0) or 0
+                fetched = (page - 1) * PAGE_SIZE + len(matches)
                 print(f"    >> Page {page} - {fetched:,}/{total:,} ...", end="\r", flush=True)
-                if fetched >= total or len(matches) < PAGE_SIZE: break
+                # Do not stop on short pages alone: Shodan can return < limit mid-query;
+                # stopping on len(matches) < PAGE_SIZE cut runs short vs total (e.g. 109 vs 3,497).
+                if total > 0 and fetched >= total:
+                    break
                 page += 1
                 time.sleep(SLEEP_BETWEEN)
             print(f"    >> +{new_count:,} new records saved              ")
