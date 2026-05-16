@@ -262,6 +262,56 @@ def shodan_count(api, query):
     return -1
 
 def stream_search(api, query, label, seen_keys, query_writer, master_writer):
+    """
+    بيستخدم search_cursor لسحب كل النتايج بدون حد
+    لو cursor مش متاح بيعمل fallback للـ pagination
+    """
+    new_count = 0
+    fetched   = 0
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            cursor = api.search_cursor(query)
+            for item in cursor:
+                try:
+                    item["_source"] = label
+                    ip  = item.get("ip_str","")
+                    key = f"{ip}:{item.get('port','')}"
+                    fetched += 1
+                    if ip and key not in seen_keys:
+                        seen_keys.add(key)
+                        query_writer.write(item)
+                        master_writer.write(item)
+                        new_count += 1
+                    if fetched % 500 == 0:
+                        print(f"    >> Fetched: {fetched:,} | New: {new_count:,} ...",
+                              end="\r", flush=True)
+                except Exception:
+                    continue
+            print(f"    >> +{new_count:,} new records | {fetched:,} fetched total              ")
+            return new_count
+
+        except shodan.APIError as e:
+            err = str(e)
+            if "No information available" in err or "empty" in err.lower():
+                print(f"    >> 0 results")
+                return 0
+            if "cursor" in err.lower() or "upgrade" in err.lower() or "payment" in err.lower():
+                print(f"    [!] Cursor not available — falling back to pagination ...")
+                return _paginated_search(api, query, label, seen_keys,
+                                         query_writer, master_writer)
+            if is_network_error(e):
+                print(f"\n    [!] Network ({attempt}/{MAX_RETRIES}) - wait {RETRY_WAIT}s ...")
+                time.sleep(RETRY_WAIT)
+            else:
+                print(f"\n    [!] Shodan error: {e} — falling back to pagination ...")
+                return _paginated_search(api, query, label, seen_keys,
+                                         query_writer, master_writer)
+    return new_count
+
+
+def _paginated_search(api, query, label, seen_keys, query_writer, master_writer):
+    """Fallback pagination — max 10,000 results"""
     new_count = 0
     page      = 1
     for attempt in range(1, MAX_RETRIES + 1):
@@ -279,22 +329,17 @@ def stream_search(api, query, label, seen_keys, query_writer, master_writer):
                         query_writer.write(item)
                         master_writer.write(item)
                         new_count += 1
-                total   = result.get("total", 0) or 0
+                total   = result.get("total", 0)
                 fetched = (page - 1) * PAGE_SIZE + len(matches)
                 print(f"    >> Page {page} - {fetched:,}/{total:,} ...", end="\r", flush=True)
-                # Do not stop on short pages alone: Shodan can return < limit mid-query;
-                # stopping on len(matches) < PAGE_SIZE cut runs short vs total (e.g. 109 vs 3,497).
-                if total > 0 and fetched >= total:
-                    break
+                if fetched >= total or len(matches) < PAGE_SIZE: break
                 page += 1
                 time.sleep(SLEEP_BETWEEN)
             print(f"    >> +{new_count:,} new records saved              ")
             return new_count
         except shodan.APIError as e:
             err = str(e)
-            if "No information available" in err or "empty" in err.lower():
-                print(f"    >> 0 results")
-                return 0
+            if "No information available" in err: return 0
             if is_network_error(e):
                 print(f"\n    [!] Network ({attempt}/{MAX_RETRIES}) - wait {RETRY_WAIT}s ...")
                 time.sleep(RETRY_WAIT)
@@ -303,6 +348,88 @@ def stream_search(api, query, label, seen_keys, query_writer, master_writer):
                 print(f"\n    [!] Shodan: {e}")
                 return new_count
     return new_count
+
+# كل دول العالم ISO codes
+ALL_COUNTRIES = [
+    "AF","AX","AL","DZ","AS","AD","AO","AI","AQ","AG","AR","AM","AW","AU","AT",
+    "AZ","BS","BH","BD","BB","BY","BE","BZ","BJ","BM","BT","BO","BQ","BA","BW",
+    "BR","IO","BN","BG","BF","BI","CV","KH","CM","CA","KY","CF","TD","CL","CN",
+    "CO","KM","CG","CD","CK","CR","CI","HR","CU","CW","CY","CZ","DK","DJ","DM",
+    "DO","EC","EG","SV","GQ","ER","EE","SZ","ET","FK","FO","FJ","FI","FR","GF",
+    "PF","GA","GM","GE","DE","GH","GI","GR","GL","GD","GP","GU","GT","GG","GN",
+    "GW","GY","HT","VA","HN","HK","HU","IS","IN","ID","IR","IQ","IE","IM","IL",
+    "IT","JM","JP","JE","JO","KZ","KE","KI","KP","KR","KW","KG","LA","LV","LB",
+    "LS","LR","LY","LI","LT","LU","MO","MG","MW","MY","MV","ML","MT","MH","MQ",
+    "MR","MU","YT","MX","FM","MD","MC","MN","ME","MS","MA","MZ","MM","NA","NR",
+    "NP","NL","NC","NZ","NI","NE","NG","NU","NF","MK","MP","NO","OM","PK","PW",
+    "PS","PA","PG","PY","PE","PH","PL","PT","PR","QA","RE","RO","RU","RW","BL",
+    "SH","KN","LC","MF","PM","VC","WS","SM","ST","SA","SN","RS","SC","SL","SG",
+    "SX","SK","SI","SB","SO","ZA","SS","ES","LK","SD","SR","SE","CH","SY","TW",
+    "TJ","TZ","TH","TL","TG","TK","TO","TT","TN","TR","TM","TC","TV","UG","UA",
+    "AE","GB","US","UM","UY","UZ","VU","VE","VN","VG","VI","WF","EH","YE","ZM","ZW"
+]
+
+
+def _fetch_large_country(api, base_query, country, seen_keys,
+                          master_writer, group_writer):
+    total_new = 0
+    try:
+        facets = api.search(f"{base_query} country:{country}", facets=["isp:20"])
+        isps   = [f[0] for f in facets.get("facets",{}).get("isp",[])]
+    except Exception:
+        isps = []
+
+    if isps:
+        for isp in isps:
+            isp_query = f'{base_query} country:{country} isp:"{isp}"'
+            count     = shodan_count(api, isp_query)
+            if count and count > 0:
+                print(f"    ISP: {isp[:40]} — {count:,}")
+                new = stream_search(api, isp_query, isp_query,
+                                    seen_keys, group_writer, master_writer)
+                total_new += new
+                time.sleep(SLEEP_BETWEEN)
+
+    # الباقي
+    new = stream_search(api, f"{base_query} country:{country}",
+                        f"{base_query} country:{country}",
+                        seen_keys, group_writer, master_writer)
+    total_new += new
+    return total_new
+
+
+def run_query_by_country(api, base_query, seen_keys, session_dir,
+                          master_writer, cp, group_writer):
+    total_new = 0
+    for i, country in enumerate(ALL_COUNTRIES, 1):
+        cp_key = f"{base_query}__cc_{country}"
+        if cp.is_done(cp_key):
+            print(f"  [{i}/{len(ALL_COUNTRIES)}] {country} — SKIP")
+            continue
+
+        country_query = f"{base_query} country:{country}"
+        count         = shodan_count(api, country_query)
+
+        if count == 0:
+            cp.mark_query_complete(cp_key, 0)
+            continue
+
+        print(f"  [{i}/{len(ALL_COUNTRIES)}] {country} — {count:,}")
+
+        if count > 10000:
+            new = _fetch_large_country(api, base_query, country,
+                                        seen_keys, master_writer, group_writer)
+        else:
+            new = stream_search(api, country_query, country_query,
+                                seen_keys, group_writer, master_writer)
+
+        total_new += new
+        cp.mark_query_complete(cp_key, new)
+        cp.set_seen_keys(seen_keys)
+        time.sleep(SLEEP_BETWEEN)
+
+    return total_new
+
 
 def run_query(api, query, seen_keys, session_dir, master_writer, cp,
               group_writer=None, test_mode=False):
@@ -319,8 +446,17 @@ def run_query(api, query, seen_keys, session_dir, master_writer, cp,
         print(f"  [TEST] OK - {total:,} results")
         cp.mark_query_complete(query, 0)
         return total
+
     q_writer = group_writer or StreamWriter(session_dir, sanitize(query))
-    new = stream_search(api, query, query, seen_keys, q_writer, master_writer)
+
+    # لو أكتر من 10,000 — قسّم على دول تلقائياً
+    if total > 10000:
+        print(f"  [*] {total:,} > 10,000 — splitting by country automatically ...")
+        new = run_query_by_country(api, query, seen_keys, session_dir,
+                                    master_writer, cp, q_writer)
+    else:
+        new = stream_search(api, query, query, seen_keys, q_writer, master_writer)
+
     if group_writer is None: q_writer.close()
     print(f"  Total unique: {len(seen_keys):,}")
     cp.set_seen_keys(seen_keys)
